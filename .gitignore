@@ -1,0 +1,83 @@
+# ===============================
+# Python
+# ===============================
+__pycache__/
+*.py[cod]
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# ===============================
+# Virtual environments
+# ===============================
+.venv/
+venv/
+env/
+.model_venv/
+
+# ===============================
+# PyTorch / Training artifacts
+# ===============================
+*.pt
+*.pth
+*.ckpt
+*.ckpt.*
+checkpoints/
+model/checkpoints/
+runs/
+wandb/
+lightning_logs/
+
+# ===============================
+# Logs
+# ===============================
+*.log
+logs/
+
+# ===============================
+# Dataset (BraTS, synthesis data)
+# ===============================
+data/
+BraTS*/
+BraTS2021_Training_Data/
+BraTS2023*/
+BraTS2024*/
+*.nii
+*.nii.gz
+
+# ===============================
+# MONAI / cache
+# ===============================
+.cache/
+.monai/
+
+# ===============================
+# Jupyter / IDE
+# ===============================
+.ipynb_checkpoints/
+.vscode/
+.idea/
+
+# ===============================
+# OS
+# ===============================
+.DS_Store
+Thumbs.db
+
+# ===============================
+# Temporary / misc
+# ===============================
+tmp/
+temp/
+*.swp
+*.swo
+
+# Weights
+*.pth
+*.pt
+checkpoints/
+
+# Python
+__pycache__/
