@@ -17,6 +17,7 @@ class ModalityDecoder(nn.Module):
         self.up1 = nn.ConvTranspose3d(latent_dim, base_channels * 4, 4, 2, 1)
         self.dec1 = nn.Sequential(
             Conv3DBlock(base_channels * 4, base_channels * 4),
+            ResBlock3D(base_channels * 4),
             ResBlock3D(base_channels * 4)
         )
         self.up2 = nn.ConvTranspose3d(base_channels * 4, base_channels * 2, 4, 2, 1)

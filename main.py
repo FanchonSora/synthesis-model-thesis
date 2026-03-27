@@ -11,5 +11,5 @@ train(
     device=device,
     num_epochs=300,
     lr=1e-4,
-    checkpoint_dir="/home/nvsinh1/brats_segmentation/synthesis-model/model_training",
+    checkpoint_dir="/home/nvsinh1/brats_segmentation/synthesis-model/model",
 )

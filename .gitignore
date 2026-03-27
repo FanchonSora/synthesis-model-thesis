@@ -24,6 +24,7 @@ env/
 *.pth
 *.ckpt
 *.ckpt.*
+*.png
 checkpoints/
 model/checkpoints/
 runs/

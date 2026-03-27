@@ -1,0 +1,380 @@
+# BraTS Missing Modality Synthesis — Tài liệu kỹ thuật
+
+## Tổng quan
+
+Hệ thống sinh ảnh MRI não bộ cho modality bị thiếu (missing modality synthesis)
+từ các modalities còn lại. Được xây dựng trên nền tảng **Latent Diffusion Model (LDM)**
+với kiến trúc encoder–fuser–diffusion UNet–decoder hoàn toàn 3D.
+
+**Input:** Tập hợp bất kỳ 3 trong 4 modality MRI: T1, T1ce, T2, FLAIR  
+**Output:** Modality bị thiếu được tổng hợp, kích thước `[1, 128, 128, 128]`
+
+---
+
+## Kiến trúc mô hình
+
+### Tổng quan luồng dữ liệu
+
+```
+[T1]    → ModalityEncoder → SharedProjection →┐
+[T1ce]  → ModalityEncoder → SharedProjection →┤
+[T2]    → ModalityEncoder → SharedProjection →┤→ CrossModalFusion → z_cond
+[FLAIR] → ModalityEncoder → SharedProjection →┘        │
+                                                         ▼
+[Target GT] → ModalityEncoder → SharedProjection → z_target
+                                                         │
+                                               ForwardDiffusion(t)
+                                                         │
+                                                        z_t
+                                                         │
+                                              DiffusionUNet(z_t, z_cond, t)
+                                                         │
+                                                     v_hat (v-prediction)
+                                                         │
+                                                  Estimate z_0_hat
+                                                         │
+                                              ModalityDecoder → x_hat
+```
+
+---
+
+### 1. ModalityEncoder
+
+Mỗi modality có encoder riêng biệt với kiến trúc CNN 3D:
+
+```
+Input: [B, 1, 128, 128, 128]
+  → Conv3DBlock(1, 16) + ResBlock3D(16)         [B, 16, 128, 128, 128]
+  → Conv3d stride-2 → enc2 + ResBlock3D(32)     [B, 32, 64, 64, 64]
+  → Conv3d stride-2 → enc3 + ResBlock3D(64)     [B, 64, 32, 32, 32]
+  → Conv3d stride-2                             [B, 128, 16, 16, 16]
+  → ResBlock3D × 2 (bottleneck)
+Output: [B, 128, 16, 16, 16]   (latent_dim=128, 8× spatial downsampling)
+```
+
+**Conv3DBlock:** Conv3d → GroupNorm → SiLU  
+**ResBlock3D:** Conv3DBlock → Conv3d → GroupNorm → SE-attention → SiLU + residual  
+**SE-attention:** AdaptiveAvgPool → Linear(C, C//8) → ReLU → Linear(C//8, C) → Sigmoid
+
+### 2. SharedProjection
+
+Đưa tất cả encoders về không gian latent chung:
+
+```
+Input: [B, 128, 16, 16, 16]
+  → Conv3DBlock → Conv3DBlock → Conv3d(1×1×1)
+Output: [B, 128, 16, 16, 16]
+```
+
+### 3. Cross-Modality Fusion
+
+Tổng hợp thông tin từ các available modalities bằng Multi-head Attention:
+
+```
+z_list: [z_t1, z_t1ce, z_t2, z_flair]   each [B, 128, 16, 16, 16]
+  → Zero-out missing modalities (theo modality_mask)
+  → Stack → [B, 4, 128, 16, 16, 16]
+  → Reshape → [B×16×16×16, 4, 128]      (flatten spatial, treat voxel as batch)
+  → MultiheadAttention(embed=128, heads=4)
+  → Mean pool across modality dim
+  → Reshape → [B, 128, 16, 16, 16]
+  → Conv3d(1×1×1)                        z_cond
+```
+
+### 4. Diffusion UNet (DiffusionUNet + UNet3D)
+
+**DiffusionUNet** wrapper xử lý conditioning:
+
+```
+Inputs: z_t [B,128,16,16,16], z_cond [B,128,16,16,16], t, target_id, mask, domain_id
+
+Conditioning embedding:
+  t → sinusoidal(256) → MLP(256,256)                     t_emb [B, 256]
+  target_id → Embedding(4, 128)                           mod_emb [B, 128]
+  domain_id → Embedding(3, 128)                           dom_emb [B, 128]
+  modality_mask → Linear(4, 128)                          mask_emb [B, 128]
+  → cat → [B, 640] → Linear(640,128) → SiLU → Linear(128,128)
+  → cond [B, 128]
+
+Input prep:
+  cat([z_t, z_cond], dim=1) → Conv3DBlock(256, 128) → + cond[...,None,None,None]
+  → x [B, 128, 16, 16, 16]
+  → UNet3D(x, cond=z_cond)
+```
+
+**UNet3D** encoder-decoder backbone (base_ch=96):
+
+```
+Stem: Conv3DBlock + ResBlock3D              [B, 96, 16, 16, 16]    s0
+Down1: Conv3d-2×, ResBlock3D×2              [B, 192, 8, 8, 8]      s1
+Down2: Conv3d-2×, ResBlock3D×2              [B, 384, 4, 4, 4]      s2
+  + CrossAttention3D với z_cond (4×4×4)
+Down3: Conv3d-2×, ResBlock3D×2              [B, 768, 2, 2, 2]      s3
+
+Mid: ResBlock3D → CrossAttention3D(z_cond) → AttentionBlock3D → ResBlock3D
+
+Up3: ConvTranspose3d + cat(s3) → ResBlock3D×2  [B, 384, 4, 4, 4]
+  + CrossAttention3D với z_cond
+Up2: ConvTranspose3d + cat(s2) → ResBlock3D×2  [B, 192, 8, 8, 8]
+  + CrossAttention3D với z_cond
+Up1: ConvTranspose3d + cat(s1) → ResBlock3D×2  [B, 96, 16, 16, 16]
+  + AttentionBlock3D (self-attention)
+
+mid_feat = feature sau Up1 (trước conv_out), dùng cho deep supervision
+Output: Conv3d(96, 128, 3×3×3)             [B, 128, 16, 16, 16]
+```
+
+**Multi-scale cross-attention:** z_cond được inject ở 4 vị trí (down2, mid, up3, up2)
+với projection riêng tại mỗi resolution để model luôn "nhớ" conditioning.
+
+### 5. V-Prediction và Noise Schedule
+
+**Cosine beta schedule:**
+```
+αt_bar = cos²(((t/T + s) / (1 + s)) × π/2)   s=0.008
+βt = 1 - αt_bar / αt-1_bar, clamp(max=0.999)
+```
+
+**Forward diffusion:**
+```
+z_t = √αt_bar × z_0 + √(1-αt_bar) × ε,   ε ~ N(0, I)
+```
+
+**V-prediction target** (thay vì predict ε trực tiếp):
+```
+v = √αt_bar × ε - √(1-αt_bar) × z_0
+```
+Ưu điểm: ổn định hơn tại cả t lớn và t nhỏ, gradient smoother.
+
+**Reconstruct z_0 từ v_hat:**
+```
+z_0_hat = √αt_bar × z_t - √(1-αt_bar) × v_hat
+```
+
+### 6. ModalityDecoder
+
+Mỗi modality có decoder riêng, đối xứng với encoder:
+
+```
+Input: [B, 128, 16, 16, 16]
+  → ConvTranspose3d(128, 64, 4, stride=2) + Conv3DBlock + ResBlock3D  [B, 64, 32, 32, 32]
+  → ConvTranspose3d(64, 32, 4, stride=2)  + Conv3DBlock + ResBlock3D  [B, 32, 64, 64, 64]
+  → ConvTranspose3d(32, 16, 4, stride=2)  + Conv3DBlock + ResBlock3D  [B, 16, 128,128,128]
+  → Conv3d(16, 1, 3×3×3)
+Output: [B, 1, 128, 128, 128]   (no activation: z-score normalized data → unbounded)
+```
+
+---
+
+## Dataset
+
+**BraTS Multi-modal MRI Synthesis Dataset**
+
+Cấu trúc thư mục:
+```
+BraTS_Synthesis/
+  case_001/
+    t1.nii.gz
+    t1ce.nii.gz
+    t2.nii.gz
+    flair.nii.gz
+  case_002/
+    ...
+```
+
+**Pipeline tiền xử lý:**
+1. Load 4 modalities → stack → `(H, W, D, 4)`
+2. Adaptive percentile clipping: `[0.5, 99.9]` percentile (trên voxels > 0)
+3. Z-score normalization: per-modality, trên foreground voxels (> 0)
+4. Resize/pad/crop về `(128, 128, 128)`
+
+**Augmentation:**
+- Random flip 3 trục (p=0.5)
+- Random affine: rotation ±0.1 rad, scale ±10% (p=0.3)
+- Random Gaussian noise std=0.01 (p=0.2)
+
+**Lưu ý thiết kế:** Dataset trả về đầy đủ 4 modalities. Target modality được
+sample ngẫu nhiên trong training loop (không phải trong Dataset) để đảm bảo
+nhất quán giữa `x_input`, `x_target_gt`, và `modality_mask`.
+
+---
+
+## Training
+
+### Loss function
+
+```
+total_loss = L_vpred + 0.2 × L_recon + 0.01 × L_msssim + L_latent_perc
+```
+
+**L_vpred (Primary):** MSE giữa v_hat và v_target trên toàn timestep range.
+Optionally + 0.1 × MSE(z_mid_pred, z_target) cho deep supervision.
+
+**L_recon (Weighted L1):** L1 loss giữa x_hat và x_target_gt, weighted theo t:
+```
+weight = (1 - t/T)   → cao ở t nhỏ (ảnh rõ), thấp ở t lớn (ảnh noise)
+```
+Tính trên **toàn bộ batch** (không filter t < 50) để decoder luôn nhận gradient.
+
+**L_msssim (Perceptual 2D):** MS-SSIM trên middle axial slice, chỉ khi t < 50.
+Input được normalize về [0,1] và reshape về 4D [B, 1, H, W] trước khi tính.
+
+**L_latent_perc:** MSE(z_0_hat, z_target) × 0.01, chỉ khi t < 50.
+Khuyến khích latent space học cấu trúc đúng.
+
+### Timestep Sampling
+
+Biased sampling để tập trung vào denoising quality:
+```python
+if random.random() < 0.7:
+    t = (U[0,1] ** 1.8 × (T-1)).long()   # Low-t biased (structure learning)
+else:
+    t = Uniform(0, T-1)                    # Full range (diversity)
+```
+
+### Classifier-Free Guidance (CFG)
+
+10% steps train unconditionally (modality/domain embeddings zeroed, z_cond zeroed).
+Cho phép inference-time guidance:
+```
+pred_guided = pred_uncond + scale × (pred_cond - pred_uncond)
+```
+
+### Optimizer & Scheduler
+
+| Hyperparameter | Giá trị |
+|----------------|---------|
+| Optimizer | AdamW |
+| Learning rate | 1e-4 |
+| Weight decay | 1e-5 |
+| LR scheduler | CosineAnnealingLR (T_max=300) |
+| Gradient clipping | max_norm=1.0 |
+| Mixed precision | AMP (autocast + GradScaler) |
+| EMA decay | 0.9999 (TF warm-up formula) |
+| Early stopping | patience=30 epochs |
+| Batch size | 2 |
+| Total epochs | 300 |
+
+### EMA (Exponential Moving Average)
+
+Warm-up theo công thức TF:
+```
+effective_decay = min(0.9999, (1 + step) / (10 + step))
+```
+EMA weights được dùng cho inference và visualize (không phải raw model weights).
+
+### Checkpointing
+
+- Lưu `epoch_XXX.pth` mỗi epoch, giữ 3 checkpoint gần nhất
+- Lưu `best.pth` khi avg_loss đạt minimum mới
+- Tự động resume từ checkpoint mới nhất
+
+---
+
+## Visualize trong Training
+
+Mỗi epoch đầu, trước khi bắt đầu train loop:
+1. Copy EMA weights vào model
+2. Chạy **training branch** với `t=10` (rất ít noise → x_hat ≈ clean image)
+3. Lưu ảnh so sánh: GT | Input modality | Generated
+4. Restore model weights gốc
+
+Ưu điểm so với inference branch (1000 steps DDPM):
+- **Nhanh hơn ~1000×** (1 forward pass vs 1000)
+- **Ảnh đẹp từ epoch đầu**: t=10 → z_t ≈ z_0 → x_hat có cấu trúc ngay
+- **Đánh giá được ngay** chất lượng encoder–decoder pipeline
+
+---
+
+## Metrics
+
+Được tính trên samples có `t < 50` (ảnh đủ rõ để metric meaningful):
+
+| Metric | Mô tả |
+|--------|-------|
+| PSNR | Peak Signal-to-Noise Ratio (dB), tính trên full 3D volume |
+| SSIM | Structural Similarity trên middle axial slice (skimage) |
+| MAE | Mean Absolute Error trên full 3D volume |
+
+---
+
+## Tóm tắt các Bug đã Fix
+
+| # | Vị trí | Lỗi gốc | Fix |
+|---|--------|---------|-----|
+| 1 | `model.decode()` | `torch.no_grad()` block + in-place assign → gradient không flow về decoder | Loop per-sample + `torch.cat()` |
+| 2 | `train.py` - recon_loss | Chỉ tính khi `t < 50` → decoder gần như không nhận gradient (batch size 2) | Tính toàn batch, weight theo `(1 - t/T)` |
+| 3 | `train.py` - ms_ssim | Truyền 5D tensor `[B,1,H,W,D]` vào ms_ssim (chỉ nhận 4D) → RuntimeError | Lấy middle slice `[..., D//2]` → 4D, normalize [0,1] trước khi tính |
+| 4 | `visualize()` | Chạy 1000-step DDPM inference → chậm + ảnh noise ở epoch đầu | Training branch với `t=10` → 1 forward pass, ảnh rõ ngay |
+
+---
+
+## Cách chạy
+
+```python
+import torch
+from model.architecture import create_model
+from train import train
+from data.brats_dataset import train_loader
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model  = create_model()
+
+train(
+    model=model,
+    train_loader=train_loader,
+    device=device,
+    num_epochs=300,
+    lr=1e-4,
+    checkpoint_dir="/home/nvsinh1/brats_segmentation/synthesis-model/model_training",
+)
+```
+
+### Inference (sau training)
+
+```python
+import torch
+from model.architecture import create_model
+
+model = create_model()
+# Load best checkpoint
+ckpt  = torch.load("model_training/checkpoints/best.pth", map_location="cpu")
+model.load_state_dict(ckpt["model_state"])
+model.eval()
+
+# Giả sử thiếu T1ce, có T1, T2, FLAIR
+x_dict = {
+    "t1":    t1_volume,    # [1, 1, 128, 128, 128]
+    "t1ce":  torch.zeros_like(t1_volume),  # masked
+    "t2":    t2_volume,
+    "flair": flair_volume,
+}
+modality_mask = torch.tensor([[1, 0, 1, 1]])  # T1ce bị thiếu
+target_id     = torch.tensor([1])             # T1ce = index 1
+
+with torch.no_grad():
+    out = model(
+        x_dict=x_dict,
+        x_target_gt=None,   # inference mode
+        target_modality_name="t1ce",
+        target_modality_id=target_id,
+        modality_mask=modality_mask,
+        domain_id=torch.tensor([0]),
+        num_infer_steps=200,  # 200 steps DDPM (đủ chất lượng, nhanh hơn 1000)
+    )
+    t1ce_synthesized = out["x_hat"]  # [1, 1, 128, 128, 128]
+```
+
+---
+
+## Yêu cầu môi trường
+
+```
+torch >= 2.0
+monai
+nibabel
+pytorch_msssim  (optional, cho ms_ssim loss)
+scikit-image    (optional, cho SSIM metric)
+tqdm
+matplotlib
+```
